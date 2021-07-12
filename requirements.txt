@@ -1,0 +1,3 @@
+asyncio==3.4.3
+chess==1.6.1
+websockets==9.1
