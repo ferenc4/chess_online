@@ -1,10 +1,8 @@
 import random
-from dataclasses import dataclass
 
 import chess
 
 
-@dataclass
 class Bot:
     def name(self):
         raise NotImplementedError
