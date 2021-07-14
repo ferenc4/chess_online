@@ -1,9 +1,10 @@
 import asyncio
+import copy
 import json
 import logging
 import sys
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Set, Coroutine
 
 import chess
 from websockets.exceptions import ConnectionClosed
@@ -43,7 +44,8 @@ class ServerContext:
     queued_up_user: Optional[str]
     users_by_connection: Dict[WebSocketCommonProtocol, str]
     connections_by_user: Dict[str, WebSocketCommonProtocol]
-    user_mgmt_lock: asyncio.locks.Lock
+    user_mgmt_lock: asyncio.Lock
+    viewer_set_by_viewed: Dict[str, Set[str]]
 
 
 def get_cli_address(websocket: Optional[WebSocketCommonProtocol]) -> str:
@@ -94,9 +96,24 @@ def register(user: str,
 
 
 async def start_game(server_context: ServerContext, game: Game):
+    coroutines = []
     for user in game.opponents.keys():
-        await send(user=user, server_context=server_context, message=json.dumps({"type": "new_game_found",
-                                                                                 "is_white": user == game.first_user}))
+        coroutines.append(send(user=user, server_context=server_context,
+                               message=json.dumps({"type": "new_game_found", "is_white": user == game.first_user})))
+    await asyncio.wait(coroutines)
+
+
+async def send_viewer_update(game: Game,
+                             server_context: ServerContext):
+    coroutines: [Coroutine] = []
+    for user in game.opponents.keys():
+        viewers: Set[str] = server_context.viewer_set_by_viewed.get(user, set())
+        for viewer in viewers:
+            if viewer in server_context.connections_by_user:
+                coroutine: Coroutine = send(viewer, server_context,
+                                            json.dumps({"type": "update", "fen_board": game.board.fen()}))
+                coroutines.append(coroutine)
+    await asyncio.wait(coroutines)
 
 
 async def handle_move_msg(server_context: ServerContext,
@@ -108,6 +125,10 @@ async def handle_move_msg(server_context: ServerContext,
     is_game_over = outcome is not None
     is_white_to_move = game.board.turn
     winner_user = get_game_winner(game, outcome)
+
+    viewer_update_coroutine: Coroutine = send_viewer_update(game=game, server_context=server_context)
+
+    coroutines: [Coroutine] = [viewer_update_coroutine]
     for user in game.opponents.keys():
         is_white = game.first_user == user
         is_white_and_white_turn = (is_white and is_white_to_move)
@@ -119,7 +140,8 @@ async def handle_move_msg(server_context: ServerContext,
                                          "is_next_to_move": is_next_to_move,
                                          "winner": winner_user,
                                          "outcome": str(outcome)})
-        await send(user, server_context, move_made_msg)
+        coroutines.append(send(user, server_context, move_made_msg))
+    await asyncio.wait(coroutines)
 
 
 def get_game_winner(game: Game, outcome: chess.Outcome):
@@ -136,9 +158,9 @@ def get_winner(user1: str, user2: str, outcome: chess.Outcome):
     return user2
 
 
-async def handle_msg(websocket: WebSocketCommonProtocol,
-                     server_context: ServerContext,
-                     json_msg: dict):
+async def handle_player_msg(websocket: WebSocketCommonProtocol,
+                            server_context: ServerContext,
+                            json_msg: dict):
     user: str = json_msg.get("user")
     # retrieve game, or register then queue or start new game
     new_game_opt: Optional[Game] = None
@@ -181,7 +203,15 @@ async def unregister(websocket: WebSocketCommonProtocol,
 async def on_connection(websocket: WebSocketCommonProtocol,
                         server_context: ServerContext,
                         path: str):
-    logger.info(f"{get_cli_address(websocket)} Opening new websocket connection")
+    logger.info(f"{get_cli_address(websocket)} Opening new websocket connection for path <{path}>")
+    is_viewer = path == "/spectate"
+    if is_viewer:
+        await on_viewer_connection(server_context, websocket)
+    else:
+        await on_player_connection(server_context, websocket)
+
+
+async def on_player_connection(server_context: ServerContext, websocket: WebSocketCommonProtocol):
     message_idx = 0
     last_message = None
     try:
@@ -190,11 +220,11 @@ async def on_connection(websocket: WebSocketCommonProtocol,
             logger.info(f"{session_id} #{message_idx + 1} Received < {str_msg} >")
             last_message = str_msg
             json_msg: dict = json.loads(str_msg)
-            await handle_msg(websocket=websocket, server_context=server_context, json_msg=json_msg)
+            await handle_player_msg(websocket=websocket, server_context=server_context, json_msg=json_msg)
             message_idx += 1
         logger.info(f"{get_cli_address(websocket)} Finished receiving messages")
     except ConnectionClosed:
-        await unregister(websocket, server_context)
+        logger.error(f"{get_cli_address(websocket)} Connection closed")
     except:
         logger.exception(f"{get_cli_address(websocket)} An exception occurred while processing message "
                          f"< {last_message} >.",
@@ -202,6 +232,57 @@ async def on_connection(websocket: WebSocketCommonProtocol,
         websocket.fail_connection()
     finally:
         await unregister(websocket, server_context)
+
+
+async def handle_viewer_msg(websocket: WebSocketCommonProtocol,
+                            server_context: ServerContext,
+                            json_msg: dict):
+    user: str = json_msg.get("user")
+    viewed: str = json_msg.get("viewed")
+
+    existing_user: Optional[str] = server_context.users_by_connection.get(websocket, None)
+    existing_connection: Optional[WebSocketCommonProtocol] = server_context.connections_by_user.get(user, None)
+    # todo check existing values are consistent with new ones, if there are any
+
+    if existing_user is not None:
+        return
+    server_context.users_by_connection[websocket] = user
+    server_context.connections_by_user[user] = websocket
+
+    async with server_context.user_mgmt_lock:
+        viewer_set: set = server_context.viewer_set_by_viewed.get(viewed, set())
+        viewer_set.add(user)
+        server_context.viewer_set_by_viewed[viewed] = viewer_set
+
+    game_opt: Optional[Game] = server_context.games_by_user.get(viewed, None)
+    if game_opt is None:
+        return
+    board: chess.Board = copy.deepcopy(game_opt.board)
+    fen_boards: [str] = [board.fen()]
+    move_stack_size: int = len(board.move_stack)
+    for _ in range(move_stack_size):
+        board.pop()
+        fen_boards.append(board.fen())
+    await send(user, server_context, json.dumps({"type": "bulk_update", "fen_boards": fen_boards}))
+
+
+async def on_viewer_connection(server_context: ServerContext, websocket: WebSocketCommonProtocol):
+    message_idx = 0
+    last_message = None
+
+    try:
+        async for str_msg in websocket:
+            session_id = get_cli_address(websocket)
+            logger.info(f"{session_id} #{message_idx + 1} Received < {str_msg} >")
+            json_msg: dict = json.loads(str_msg)
+            await handle_viewer_msg(websocket=websocket, server_context=server_context, json_msg=json_msg)
+    except ConnectionClosed:
+        logger.error(f"{get_cli_address(websocket)} Connection closed")
+    except:
+        logger.exception(f"{get_cli_address(websocket)} An exception occurred while processing message "
+                         f"< {last_message} >.",
+                         exc_info=sys.exc_info())
+        websocket.fail_connection()
 
 
 def generate_game(user1, user2):
@@ -214,7 +295,7 @@ def generate_game(user1, user2):
 
 class WsServer(GenericServer):
     def __init__(self):
-        self.context = ServerContext(dict(), dict(), None, dict(), dict(), asyncio.Lock())
+        self.context = ServerContext(dict(), dict(), None, dict(), dict(), asyncio.Lock(), dict())
 
     def start(self, host: str, port: int):
         logger.info(f"Starting websocket server as ws://{host}:{port}")

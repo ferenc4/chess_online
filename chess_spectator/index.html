@@ -1,0 +1,49 @@
+<html>
+<head>
+    <link type="text/css" rel="stylesheet"
+          href="node_modules/@chrisoakman/chessboardjs/dist/chessboard-1.0.0.min.css">
+</head>
+<body style="padding: 0; margin: 0;">
+<div style="background-color: #1c1c21; display: flex; justify-content: center; align-items: center; min-height: 100%">
+<div id="myBoard" style="width: 1000px; max-height: 75%; max-width: 75%"></div>
+</div>
+<script src="node_modules/jquery/dist/jquery.min.js"></script>
+<script src="node_modules/@chrisoakman/chessboardjs/dist/chessboard-1.0.0.min.js"></script>
+<script src="node_modules/chess.js/chess.js"></script>
+<script type="text/javascript">
+function getUuid(){
+   let S4 = () => Math.floor((1+Math.random())*0x10000).toString(16).substring(1);
+   let guid = `${S4()}${S4()}-${S4()}-${S4()}-${S4()}-${S4()}${S4()}${S4()}`;
+
+   return guid.toLowerCase();
+}
+
+let config = {
+  position: 'start'
+}
+let board = Chessboard('myBoard', config);
+let history = []
+
+ws = new WebSocket("ws://127.0.0.1:8765/spectate");
+userToSpectate = prompt("Enter the name of the user to spectate")
+ws.onopen = function () {
+    let strMsg = JSON.stringify({"user": "viewer" + getUuid(), "viewed": userToSpectate});
+    ws.send(strMsg);
+};
+ws.onmessage = function (event) {
+    let text = event.data;
+    let msg = JSON.parse(text);
+    if (msg.type == "update") {
+        history.push(msg.fen_board);
+    } else if (msg.type == "bulk_update") {
+        history = msg.fen_boards;
+    }
+    board.position(history[history.length - 1], false);
+    console.log("Updated to " + history);
+};
+ws.onclose = function () {
+};
+
+</script>
+</body>
+</html>

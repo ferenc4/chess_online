@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sys
+import time
 import uuid
 
 import chess
@@ -8,12 +10,10 @@ import websockets
 from chess_bot.bot import Bot, RandomBot
 
 
-async def run_for_one():
-    uri = "ws://localhost:8765"
+async def run_for_one(bot: Bot, username: str, host="localhost", port=8765):
+    uri = f"ws://{host}:{port}"
     try:
         board: chess.Board = chess.Board()
-        bot: Bot = RandomBot()
-        username = f"test_client_{uuid.uuid4()}"
         ws: websockets.WebSocketClientProtocol = await websockets.connect(uri)
         out_msg = json.dumps({"user": username})
         await ws.send(out_msg)
@@ -24,6 +24,7 @@ async def run_for_one():
             await send_next_move(username, board, bot, ws)
 
         while True:
+            time.sleep(1)
             board_update_msg: dict = await receive_json(ws)
             board = chess.Board(fen=board_update_msg.get("fen_board"))
             is_game_running = board_update_msg.get("outcome") == "None"
@@ -53,5 +54,7 @@ async def receive_json(ws) -> dict:
 
 
 if __name__ == '__main__':
-    RandomBot()
-    asyncio.get_event_loop().run_until_complete(run_for_one())
+    bot: Bot = RandomBot()
+    username: str = sys.argv[1]
+
+    asyncio.get_event_loop().run_until_complete(run_for_one(bot, username))

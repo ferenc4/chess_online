@@ -1,0 +1,15 @@
+{
+  "name": "chess_spectator",
+  "version": "1.0.0",
+  "description": "A JS client to view chess games on the chess_server.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@chrisoakman/chessboardjs": "^1.0.0",
+    "chess.js": "^0.12.0"
+  }
+}
